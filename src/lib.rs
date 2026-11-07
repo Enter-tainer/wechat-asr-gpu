@@ -33,3 +33,9 @@ pub fn load(dir: &Path) -> Result<Arc<Model>> {
     *c = Some((dir.to_path_buf(), m.clone()));
     Ok(m)
 }
+
+/// 释放模型（触发出 GPU 上下文销毁：写回 cublasLt 算法缓存、释放显存）。
+/// 静态缓存会一直持有 Arc，所以进程结束前要显式调用一次。
+pub fn unload() {
+    *CACHE.lock().unwrap() = None;
+}

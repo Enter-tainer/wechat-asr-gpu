@@ -1,4 +1,5 @@
 //! HTK 风格 FBank：39 维 log-mel + 对数能量，25ms 窗 / 10ms 帧移；减去最近 0.5 秒的滑动均值
+use rayon::prelude::*;
 use std::collections::VecDeque;
 
 const WIN: usize = 400;
@@ -126,9 +127,23 @@ impl Fbank {
 
     pub fn push(&mut self, pcm: &[i16], out: &mut Vec<[f32; DIM]>) {
         self.buf.extend_from_slice(pcm);
-        let mut p = 0;
-        while p + WIN <= self.buf.len() {
-            let f = frame(&self.buf[p..p + WIN]);
+        // 可出帧数：每 HOP 步进一帧，需覆盖 WIN 个采样
+        let nfr = if self.buf.len() >= WIN { (self.buf.len() - WIN) / HOP + 1 } else { 0 };
+        if nfr == 0 {
+            return;
+        }
+        // 1) FFT + mel：逐帧独立。批模式整段喂进来时按帧并行（这是 fbank 的主要耗时，f64 FFT512）；
+        //    流式小块（每次只出 1~2 帧）时并行调度开销大于收益，退回串行。
+        //    两种情况调用的是同一个 frame()，结果与单线程版本逐位相同。
+        const PAR_MIN: usize = 16;
+        let force_serial = std::env::var("WTL_FBANK_SERIAL").is_ok();
+        let raws: Vec<[f64; DIM]> = if nfr >= PAR_MIN && !force_serial {
+            (0..nfr).into_par_iter().map(|k| frame(&self.buf[k * HOP..k * HOP + WIN])).collect()
+        } else {
+            (0..nfr).map(|k| frame(&self.buf[k * HOP..k * HOP + WIN])).collect()
+        };
+        // 2) CMS 滚动均值：保持原来的顺序累加（浮点顺序不变，结果与单线程版本逐位一致）
+        for f in raws {
             if self.hist.len() == CMS_WIN {
                 let o = self.hist.pop_front().unwrap();
                 (0..DIM).for_each(|i| self.sum[i] -= o[i]);
@@ -136,9 +151,8 @@ impl Fbank {
             self.hist.push_back(f);
             (0..DIM).for_each(|i| self.sum[i] += f[i]);
             out.push(self.sub(&f));
-            p += HOP;
         }
-        self.buf.drain(..p);
+        self.buf.drain(..nfr * HOP);
     }
 
     /// 按当前滑动均值归一化的静音帧

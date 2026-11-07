@@ -105,9 +105,8 @@ fn main() {
         let audio = pcm.len() as f64 / 16000.0;
         let t = Instant::now();
         let mut s = Stream::new(m.clone());
-        for c in pcm.chunks(320) {
-            s.push(c);
-        }
+        // 批模式整段喂入：fbank 可以按帧并行；commit 仍按 --blk 分块进行
+        s.push(&pcm);
         let text = s.finish();
         let ms = t.elapsed().as_secs_f64() * 1e3;
         total_audio += audio;
@@ -170,4 +169,6 @@ fn main() {
         writeln!(f, "}}").unwrap();
         eprintln!("JSON 已写入 {p}");
     }
+    // 释放模型：触发出 GPU 上下文销毁（写回 cublasLt 算法缓存、释放显存）
+    wechat_asr_gpu::unload();
 }
