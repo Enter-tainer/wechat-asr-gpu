@@ -1,0 +1,27 @@
+[package]
+name = "wechat-asr-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "微信输入法离线 ASR 引擎（wtlocal / .xnet）的纯 Rust + CUDA 复刻：批模式转写，GPU 长音频 ~22-27x、批吞吐 ~640x 实时"
+license = "MIT"
+repository = "https://github.com/Enter-tainer/wechat-asr-gpu"
+readme = "README.md"
+
+[lib]
+name = "wechat_asr_gpu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wasr"
+path = "src/bin/wasr.rs"
+
+[dependencies]
+anyhow = "1"
+memmap2 = "0.9"
+rayon = "1"
+hound = "3"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

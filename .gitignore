@@ -1,0 +1,24 @@
+# 构建产物
+/target
+*.so
+*.o
+*.a
+
+# 模型权重（来自官方语音包，不入库）
+/models
+*.xnet
+*.apk
+dict.decoder.utf8.txt
+
+# 音频与基准输出
+*.wav
+*.json
+!Cargo.lock
+bench-out/
+
+# 编辑器 / Python
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.swp
