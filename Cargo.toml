@@ -22,6 +22,14 @@ rayon = "1"
 hound = "3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+[features]
+default = ["cuda"]
+# NVIDIA GPU 后端（csrc/*.cu → libwasr_gpu.so，需要 nvcc + cuBLASLt）
+cuda = []
+# Apple Silicon 后端（csrc_mlx/ → libwasr_mlx.a + MLX 的 libmlx.dylib）
+#   cargo build --release --no-default-features --features mlx
+mlx = []
+
 [profile.release]
 lto = true
 codegen-units = 1

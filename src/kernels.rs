@@ -67,7 +67,7 @@ pub fn qgemm(x: &QAct, w: &[i8], n: usize, ws: f32, bias: Option<&[f32]>) -> Vec
 fn dot(x: &[i8], xr: usize, w: &[i8], wr: usize, k: usize) -> [[i32; 4]; 2] {
     let xp = [x.as_ptr(), x[(xr - 1) * k..].as_ptr()];
     let wp: [*const i8; 4] = std::array::from_fn(|b| w[b.min(wr - 1) * k..].as_ptr());
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", neon_dotprod))]
     if k % 16 == 0 {
         return unsafe { neon::dot2x4(xp, wp, k) };
     }
@@ -102,7 +102,7 @@ fn avx2() -> bool {
     *F.get_or_init(|| std::is_x86_feature_detected!("avx2"))
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", neon_dotprod))]
 mod neon {
     use std::arch::aarch64::*;
 
