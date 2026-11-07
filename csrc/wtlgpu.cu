@@ -36,9 +36,168 @@
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #define WTL_MAX_CACHE 512
 #define WTL_MAX_PAD 4
 #define WTL_SCRATCH_BYTES (24ull * 1024 * 1024) /* initial int32 acc scratch, grows on demand */
+
+
+/* ---------------- cublasLt 算法选择磁盘缓存 ----------------
+ * 同一台 GPU + 同一套 CUDA/cuBLASLt 版本下，(k,n,t) → 最优 algo 是稳定的。
+ * 首次会做启发式候选实测（每个形状几十 ms），之后从磁盘直接读，跳过整段 warmup。
+ * 文件: $WTL_ALGO_CACHE 或 ${XDG_CACHE_HOME:-$HOME/.cache}/wasr/lt_algo.bin
+ * 失效保护: 头部记录 GPU 名 / driver / CUDA runtime 版本，不匹配整份丢弃；
+ *           若缓存的 algo 在实际调用时报错，wp_gemm 会删条目并重新搜索。
+ * 调试: WTL_ALGO_CACHE_LOG=1 打印命中/写回；WTL_ALGO_CACHE=/dev/null 关闭。
+ */
+#define WTL_LT_MAGIC 0x574c5443u /* "WLTC" */
+#define WTL_LT_VER 1
+
+struct WtlLtEntry {
+  int32_t k, n, t;
+  int32_t ws_required;
+  unsigned char algo[sizeof(cublasLtMatmulAlgo_t)];
+};
+
+struct WtlLtHeader {
+  uint32_t magic, ver;
+  char gpu[64];
+  int32_t driver, cuda;
+  int32_t count;
+};
+
+struct WtlLtDisk {
+  bool loaded = false, dirty = false, usable = true;
+  char path[1024] = {0};
+  std::vector<WtlLtEntry> e;
+};
+
+static WtlLtDisk& lt_disk() {
+  static WtlLtDisk d;
+  return d;
+}
+
+static void lt_disk_path(char* out, size_t cap) {
+  const char* p = getenv("WTL_ALGO_CACHE");
+  if (p && *p) {
+    snprintf(out, cap, "%s", p);
+    return;
+  }
+  const char* x = getenv("XDG_CACHE_HOME");
+  const char* h = getenv("HOME");
+  if (x && *x) snprintf(out, cap, "%s/wasr", x);
+  else snprintf(out, cap, "%s/.cache/wasr", h && *h ? h : ".");
+  mkdir(out, 0755);
+  size_t l = strlen(out);
+  snprintf(out + l, cap - l, "/lt_algo.bin");
+}
+
+static void lt_disk_load() {
+  WtlLtDisk& d = lt_disk();
+  if (d.loaded) return;
+  d.loaded = true;
+  lt_disk_path(d.path, sizeof(d.path));
+  FILE* f = fopen(d.path, "rb");
+  if (!f) return;
+  WtlLtHeader h{};
+  if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != WTL_LT_MAGIC || h.ver != WTL_LT_VER) {
+    fclose(f);
+    return;
+  }
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {
+    fclose(f);
+    return;
+  }
+  int driver = 0, rt = 0;
+  cudaDriverGetVersion(&driver);
+  cudaRuntimeGetVersion(&rt);
+  if (strncmp(h.gpu, prop.name, sizeof(h.gpu) - 1) != 0 || h.driver != driver || h.cuda != rt) {
+    fclose(f);
+    fprintf(stderr, "[wtlgpu] algo cache: 身份不匹配，已忽略（%s）\n", d.path);
+    return;
+  }
+  if (h.count < 0 || h.count > 4096) {
+    fclose(f);
+    return;
+  }
+  d.e.resize((size_t)h.count);
+  size_t got = fread(d.e.data(), sizeof(WtlLtEntry), (size_t)h.count, f);
+  fclose(f);
+  d.e.resize(got);
+  if (getenv("WTL_ALGO_CACHE_LOG"))
+    fprintf(stderr, "[wtlgpu] algo cache: 命中 %zu 个形状（%s）\n", d.e.size(), d.path);
+}
+
+static bool lt_disk_get(int k, int n, int t, cublasLtMatmulAlgo_t* algo, int* ws_req, size_t ws_bytes) {
+  lt_disk_load();
+  WtlLtDisk& d = lt_disk();
+  if (!d.usable) return false;
+  for (auto& x : d.e)
+    if (x.k == k && x.n == n && x.t == t) {
+      if ((size_t)x.ws_required > ws_bytes) return false;
+      memcpy(algo, x.algo, sizeof(*algo));
+      if (ws_req) *ws_req = x.ws_required;
+      return true;
+    }
+  return false;
+}
+
+static void lt_disk_put(int k, int n, int t, const cublasLtMatmulAlgo_t* algo, int ws_required) {
+  lt_disk_load();
+  WtlLtDisk& d = lt_disk();
+  if (!d.usable) return;
+  for (auto& x : d.e)
+    if (x.k == k && x.n == n && x.t == t) {
+      x.ws_required = ws_required;
+      memcpy(x.algo, algo, sizeof(x.algo));
+      d.dirty = true;
+      return;
+    }
+  WtlLtEntry e{};
+  e.k = k; e.n = n; e.t = t; e.ws_required = ws_required;
+  memcpy(e.algo, algo, sizeof(e.algo));
+  d.e.push_back(e);
+  d.dirty = true;
+}
+
+static void lt_disk_drop(int k, int n, int t) {
+  lt_disk_load();
+  WtlLtDisk& d = lt_disk();
+  for (size_t i = 0; i < d.e.size(); i++)
+    if (d.e[i].k == k && d.e[i].n == n && d.e[i].t == t) {
+      d.e.erase(d.e.begin() + (long)i);
+      d.dirty = true;
+      return;
+    }
+}
+
+static void lt_disk_save() {
+  WtlLtDisk& d = lt_disk();
+  if (!d.loaded || !d.dirty || !d.usable) return;
+  WtlLtHeader h{};
+  h.magic = WTL_LT_MAGIC;
+  h.ver = WTL_LT_VER;
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) snprintf(h.gpu, sizeof(h.gpu), "%s", prop.name);
+  cudaDriverGetVersion(&h.driver);
+  cudaRuntimeGetVersion(&h.cuda);
+  h.count = (int32_t)d.e.size();
+  char tmp[1100];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", d.path);
+  FILE* f = fopen(tmp, "wb");
+  if (!f) return;
+  fwrite(&h, sizeof(h), 1, f);
+  if (!d.e.empty()) fwrite(d.e.data(), sizeof(WtlLtEntry), d.e.size(), f);
+  fclose(f);
+  if (rename(tmp, d.path) != 0) remove(tmp);
+  d.dirty = false;
+  if (getenv("WTL_ALGO_CACHE_LOG"))
+    fprintf(stderr, "[wtlgpu] algo cache: 写回 %zu 个形状（%s）\n", d.e.size(), d.path);
+}
 
 struct CacheEntry {
   int k = 0, n = 0, t = 0;
@@ -47,6 +206,7 @@ struct CacheEntry {
   cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr;
   cublasLtMatmulAlgo_t algo{};
   int n_algo = 0;
+  bool from_disk = false;
 };
 
 /* zero-padded weight copy for n % 4 != 0 (e.g. the 10502-wide vocabulary layer) */
@@ -249,6 +409,15 @@ static bool build_entry(WpCtx* c, CacheEntry* e, int k, int n, int t) {
     fprintf(stderr, "[wtlgpu] layoutCreate failed\n");
     return false;
   }
+  /* 磁盘缓存命中 → 跳过启发式 + 候选实测（每形状省几十 ms） */
+  {
+    int ws_req = 0;
+    if (lt_disk_get(k, n, t, &e->algo, &ws_req, c->ws_bytes)) {
+      e->valid = true;
+      e->from_disk = true;
+      return true;
+    }
+  }
   cublasLtMatmulPreference_t pref = nullptr;
   cublasLtMatmulPreferenceCreate(&pref);
   cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -267,7 +436,7 @@ static bool build_entry(WpCtx* c, CacheEntry* e, int k, int n, int t) {
   int8_t* dummy_x = nullptr;
   if (cudaMalloc(&dummy_x, (size_t)k * t) != cudaSuccess) return false;
   cudaMemsetAsync(dummy_x, 1, (size_t)k * t, ss);
-  struct Cand { cublasLtMatmulAlgo_t a; double us; };
+  struct Cand { cublasLtMatmulAlgo_t a; double us; int ws; };
   std::vector<Cand> cands;
   int32_t alpha = 1, beta = 0;
   for (int i = 0; i < nres && (int)cands.size() < 6; i++) {
@@ -295,13 +464,15 @@ static bool build_entry(WpCtx* c, CacheEntry* e, int k, int n, int t) {
     }
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
-    cands.push_back({a, best});
+    cands.push_back({a, best, (int)heur[i].workspaceSize});
   }
   cudaFree(dummy_x);
   if (cands.empty()) { fprintf(stderr, "[wtlgpu] no usable algo k=%d n=%d t=%d\n", k, n, t); return false; }
   std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) { return x.us < y.us; });
   e->algo = cands[0].a;
   e->valid = true;
+  e->from_disk = false;
+  lt_disk_put(k, n, t, &e->algo, cands[0].ws);
   return true;
 }
 
@@ -404,8 +575,25 @@ static int gemm_impl(WpCtx* c, const int8_t* xq, const float* xs, int t, int k,
                                      c->acc, e->Cd, c->acc, e->Cd, &e->algo,
                                      c->ws, c->ws_bytes, stream);
   if (st != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "[wtlgpu] cublasLtMatmul failed: %s (k=%d n=%d t=%d)\n", cstat(st), k, n, t);
-    return -4;
+    if (e->from_disk) {
+      /* 磁盘缓存的算法在当前环境失效：删条目、重建 entry、重试一次 */
+      fprintf(stderr, "[wtlgpu] 缓存算法失效（%s），重搜 k=%d n=%d t=%d\n", cstat(st), k, n, t);
+      lt_disk_drop(k, n, t);
+      if (e->desc) cublasLtMatmulDescDestroy(e->desc);
+      if (e->Ad) cublasLtMatrixLayoutDestroy(e->Ad);
+      if (e->Bd) cublasLtMatrixLayoutDestroy(e->Bd);
+      if (e->Cd) cublasLtMatrixLayoutDestroy(e->Cd);
+      e->desc = nullptr; e->Ad = e->Bd = e->Cd = nullptr;
+      e->valid = false;
+      if (build_entry(c, e, k, n, t)) {
+        st = cublasLtMatmul(c->lt, e->desc, &alpha, A, e->Ad, xq, e->Bd, &beta,
+                            c->acc, e->Cd, c->acc, e->Cd, &e->algo, c->ws, c->ws_bytes, stream);
+      }
+    }
+    if (st != CUBLAS_STATUS_SUCCESS) {
+      fprintf(stderr, "[wtlgpu] cublasLtMatmul failed: %s (k=%d n=%d t=%d)\n", cstat(st), k, n, t);
+      return -4;
+    }
   }
   if (mode == 0) {
     int threads = 256;
@@ -472,6 +660,7 @@ WpCtx* wp_create(const void* w_host, size_t bytes) {
 
 void wp_destroy(WpCtx* c) {
   if (!c) return;
+  lt_disk_save();
   cudaDeviceSynchronize();
   for (int i = 0; i < c->n_cache; i++) {
     CacheEntry* e = &c->cache[i];

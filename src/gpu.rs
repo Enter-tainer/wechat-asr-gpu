@@ -33,6 +33,11 @@ extern "C" {
         out: *mut f32,
     ) -> i32;
     fn wp_stream(c: *mut c_void) -> *mut c_void;
+    fn wp_capture_begin(c: *mut c_void) -> i32;
+    fn wp_capture_end(c: *mut c_void, out_exec: *mut *mut c_void) -> i32;
+    fn wp_replay(c: *mut c_void, exec: *mut c_void) -> i32;
+    fn wp_graph_free(c: *mut c_void, exec: *mut c_void) -> i32;
+    fn wp_graph_count(c: *mut c_void) -> usize;
 }
 
 extern "C" {
@@ -91,8 +96,8 @@ fn alloc(bytes: usize) -> *mut c_void {
 
 pub struct Gpu {
     ctx: *mut c_void,
-    /// libwtlgpu 的内部 stream：GEMM 与我的小算子**都**跑在这一条上，保证发起顺序即执行顺序
-    stream: *mut c_void,
+    /// t1 → CUDA graph exec（存 usize 以便放进 Mutex<HashMap>；真实类型是 cudaGraphExec_t）
+    graphs: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
     pub tmax: usize,
     /// 一次 forward 允许的最大输入特征帧数（t1 = (t-5)/5+1 ≤ tmax）
     pub tmax_feat: usize,
@@ -130,10 +135,9 @@ impl Gpu {
         unsafe {
             let ctx = wp_create(blob.as_ptr() as *const c_void, blob.len());
             assert!(!ctx.is_null(), "wp_create 失败（权重 blob 上传）");
-            let stream = wp_stream(ctx);
             Gpu {
                 ctx,
-                stream,
+                graphs: std::sync::Mutex::new(std::collections::HashMap::new()),
                 tmax,
                 tmax_feat,
                 vocab,
@@ -161,6 +165,45 @@ impl Gpu {
                 ids: alloc(tmax * 4) as *mut u32,
             }
         }
+    }
+
+    /// 当前调用流。**必须每次现取**：capture 会把库内调用流换成可捕获的 non-blocking 流。
+    pub fn stream(&self) -> *mut c_void {
+        unsafe { wp_stream(self.ctx) }
+    }
+
+    /// 开始捕获整窗算子序列（同 t1 的窗口之后直接 replay）
+    pub fn capture_begin(&self) -> bool {
+        unsafe { wp_capture_begin(self.ctx) == 0 }
+    }
+
+    /// 结束捕获并实例化；失败返回 None（不会污染 stream）
+    pub fn capture_end(&self) -> Option<*mut c_void> {
+        let mut e: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { wp_capture_end(self.ctx, &mut e) };
+        if rc == 0 && !e.is_null() {
+            Some(e)
+        } else {
+            eprintln!("[gpu] capture 失败 rc={rc}（退回逐 kernel 执行）");
+            None
+        }
+    }
+
+    pub fn graph_get(&self, t1: usize) -> Option<*mut c_void> {
+        self.graphs.lock().unwrap().get(&t1).map(|&v| v as *mut c_void)
+    }
+
+    pub fn graph_put(&self, t1: usize, exec: *mut c_void) {
+        self.graphs.lock().unwrap().insert(t1, exec as usize);
+    }
+
+    pub fn replay(&self, exec: *mut c_void) {
+        let rc = unsafe { wp_replay(self.ctx, exec) };
+        assert_eq!(rc, 0, "wp_replay rc={rc}");
+    }
+
+    pub fn graph_count(&self) -> usize {
+        unsafe { wp_graph_count(self.ctx) }
     }
 
     /// blob 内偏移 → 显存指针（norm 的 gamma/beta、卷积权重、bias）
@@ -194,7 +237,7 @@ impl Gpu {
     pub fn front(&self, t: usize, t1: usize, c1: usize, c2: usize, c3: usize) {
         unsafe {
             wk_front(
-                self.stream,
+                self.stream(),
                 self.x,
                 self.dev(c1) as *const f32,
                 self.dev(c2) as *const f32,
@@ -210,7 +253,7 @@ impl Gpu {
 
     /// 把 y3[t1][FLAT] f32 逐行量化为 int8（与 CPU quant() 同口径）
     pub fn quant_y3(&self, t1: usize, flat: usize) {
-        unsafe { wk_quant(self.stream, self.y3, t1 as i32, flat as i32, self.y3q, self.ys) }
+        unsafe { wk_quant(self.stream(), self.y3, t1 as i32, flat as i32, self.y3q, self.ys) }
     }
 
     /// int8 GEMM：out[t][n] = (xq·wᵀ)·xs·ws + bias（bias 走权重 blob 偏移，内部流 = wp_stream）
@@ -222,7 +265,7 @@ impl Gpu {
     /// h → layernorm(g,b) → int8
     pub fn norm_quant(&self, t: usize, d: usize, g: usize, b: usize, xq: *mut i8, xs: *mut f32) {
         unsafe {
-            wk_norm_quant(self.stream, self.h, self.dev(g) as *const f32, self.dev(b) as *const f32, t as i32, d as i32, xq, xs)
+            wk_norm_quant(self.stream(), self.h, self.dev(g) as *const f32, self.dev(b) as *const f32, t as i32, d as i32, xq, xs)
         }
     }
 
@@ -230,7 +273,7 @@ impl Gpu {
     pub fn add_norm_quant(&self, t: usize, d: usize, g: usize, b: usize, xq: *mut i8, xs: *mut f32) {
         unsafe {
             wk_add_norm_quant(
-                self.stream,
+                self.stream(),
                 self.h,
                 self.o,
                 self.dev(g) as *const f32,
@@ -244,32 +287,35 @@ impl Gpu {
     }
 
     pub fn quant(&self, x: *const f32, t: usize, k: usize, xq: *mut i8, xs: *mut f32) {
-        unsafe { wk_quant(self.stream, x, t as i32, k as i32, xq, xs) }
+        unsafe { wk_quant(self.stream(), x, t as i32, k as i32, xq, xs) }
     }
 
     /// self.f 原地 gelu 后逐行量化
     pub fn gelu_quant(&self, t: usize, k: usize, xq: *mut i8, xs: *mut f32) {
-        unsafe { wk_gelu_quant(self.stream, self.f, t as i32, k as i32, xq, xs) }
+        unsafe { wk_gelu_quant(self.stream(), self.f, t as i32, k as i32, xq, xs) }
     }
 
     /// attention（libattn：cuBLAS batched sgemm + 连续内存 softmax，对数已与 CPU 参考对拍）
     pub fn attention(&self, t: usize, d: usize, heads: usize, q: *const f32, k: *const f32, v: *const f32, out: *mut f32) {
-        let rc = unsafe { wk_attention_fast(self.stream, q, k, v, t as i32, d as i32, heads as i32, self.scores, out) };
+        let rc = unsafe { wk_attention_fast(self.stream(), q, k, v, t as i32, d as i32, heads as i32, self.scores, out) };
         assert_eq!(rc, 0, "wk_attention_fast rc={rc} (t={t})");
     }
 
     pub fn add(&self, h: *mut f32, a: *const f32, t: usize, d: usize) {
-        unsafe { wk_add(self.stream, h, a, t as i32, d as i32) }
+        unsafe { wk_add(self.stream(), h, a, t as i32, d as i32) }
     }
 
     pub fn argmax(&self, x: *const f32, t: usize, n: usize, out: *mut u32) {
-        unsafe { wk_argmax(self.stream, x, t as i32, n as i32, out) }
+        unsafe { wk_argmax(self.stream(), x, t as i32, n as i32, out) }
     }
 }
 
 impl Drop for Gpu {
     fn drop(&mut self) {
         unsafe {
+            for (_, &e) in self.graphs.lock().unwrap().iter() {
+                wp_graph_free(self.ctx, e as *mut c_void);
+            }
             for p in [
                 self.x as *mut c_void,
                 self.y1 as *mut c_void,

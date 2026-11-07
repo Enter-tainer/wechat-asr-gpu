@@ -64,7 +64,7 @@ __global__ void conv1_kernel(const float* __restrict__ x, const float* __restric
     y1[idx] = acc > 0.f ? acc : 0.f;
 }
 
-// conv2: [t][32][40] → [t1][64][41]，7×7，时补 1 步长 5、频补 3，第 41 列填 0
+// conv2: [t][32][40] -> [t1][64][41]，7×7，时补 1 步长 5、频补 3，第 41 列填 0
 __global__ void conv2_kernel(const float* __restrict__ y1, const float* __restrict__ w, int t, int t1,
                              float* __restrict__ y2) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -93,7 +93,7 @@ __global__ void conv2_kernel(const float* __restrict__ y1, const float* __restri
     y2[idx] = acc > 0.f ? acc : 0.f;
 }
 
-// conv3: [t1][64][41] → [t1][192][20]，3×3，时补 1、频率步长 2
+// conv3: [t1][64][41] -> [t1][192][20]，3×3，时补 1、频率步长 2
 __global__ void conv3_kernel(const float* __restrict__ y2, const float* __restrict__ w, int t1,
                              float* __restrict__ y3) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

@@ -99,6 +99,8 @@ pub struct Model {
     vocab: Vec<String>,
     gpu: Option<Gpu>,
     plan: Option<Plan>,
+    /// 是否允许用 CUDA graph（由批模式的音频长度决定：短音频捕获开销不划算）
+    graph_on: std::sync::atomic::AtomicBool,
 }
 
 struct Loader<'a> {
@@ -275,7 +277,23 @@ impl Model {
             map,
             gpu,
             plan,
+            graph_on: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 由 Stream 按音频长度设置的开关：长音频才值得图化（短音频捕获开销 > 省下的 host 时间）
+    pub fn set_graph_on(&self, on: bool) {
+        self.graph_on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn graph_on(&self) -> bool {
+        if std::env::var("WTL_NO_GRAPH").is_ok() {
+            return false;
+        }
+        match std::env::var("WTL_GRAPH") {
+            Ok(v) => v == "1",
+            Err(_) => self.graph_on.load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     pub fn gpu_enabled(&self) -> bool {
@@ -420,7 +438,45 @@ impl Model {
             .collect()
     }
 
-    /// GPU 路径：卷积前端 + 40 层 + 输出层全在 GPU 上跑，只回 t1 个 token id
+    /// 只把该 t1 下所有 (k, n, t) 形状喂给 cuBLASLt 一次（触发算法缓存/句柄创建），
+    /// 让随后 capture 不会撞到 -6（未 warmup）；代价 ~几十 µs，不用跑整窗。
+    fn warm_shapes(&self, g: &Gpu, pl: &Plan, t1: usize) {
+        let xs = g.xs;
+        let xq = g.xq;
+        let dummy = g.lo;
+        g.gemm(xq, xs, t1, FLAT, pl.lin.off, D, pl.lin.s, pl.lin_b, g.h);
+        g.gemm(xq, xs, t1, D, pl.layers[0].q.off, D, pl.layers[0].q.s, NO_BIAS, dummy);
+        g.gemm(xq, xs, t1, D, pl.layers[0].f1.off, FF, pl.layers[0].f1.s, pl.layers[0].f1b, g.f);
+        g.gemm(xq, xs, t1, FF, pl.layers[0].f2.off, D, pl.layers[0].f2.s, pl.layers[0].f2b, dummy);
+        g.gemm(xq, xs, t1, D, pl.out.off, pl.out_n, pl.out.s, pl.out_b, g.lo);
+        // attention 内部会惰性创建 cublas handle —— 必须在 capture 之前触发，否则 capture 里 cublasCreate 非法
+        g.attention(t1, D, HEADS, g.q, g.k, g.v, g.att);
+    }
+
+    /// 整窗算子序列（不含上传/同步/取回）：正常执行与 CUDA graph 捕获共用同一份代码
+    fn window_ops(&self, g: &Gpu, pl: &Plan, t1: usize) {
+        g.gemm(g.y3q, g.ys, t1, FLAT, pl.lin.off, D, pl.lin.s, pl.lin_b, g.h);
+        for l in &pl.layers {
+            g.norm_quant(t1, D, l.pn_g, l.pn_b, g.xq, g.xs);
+            g.gemm(g.xq, g.xs, t1, D, l.q.off, D, l.q.s, NO_BIAS, g.q);
+            g.gemm(g.xq, g.xs, t1, D, l.k.off, D, l.k.s, NO_BIAS, g.k);
+            g.gemm(g.xq, g.xs, t1, D, l.v.off, D, l.v.s, NO_BIAS, g.v);
+            g.attention(t1, D, HEADS, g.q, g.k, g.v, g.att);
+            g.quant(g.att, t1, D, g.aq, g.asc);
+            g.gemm(g.aq, g.asc, t1, D, l.o.off, D, l.o.s, NO_BIAS, g.o);
+            g.add_norm_quant(t1, D, l.mn_g, l.mn_b, g.xq, g.xs);
+            g.gemm(g.xq, g.xs, t1, D, l.f1.off, FF, l.f1.s, l.f1b, g.f);
+            g.gelu_quant(t1, FF, g.fq, g.fsc);
+            g.gemm(g.fq, g.fsc, t1, FF, l.f2.off, D, l.f2.s, l.f2b, g.o);
+            g.add(g.h, g.o, t1, D);
+        }
+        g.quant(g.h, t1, D, g.aq, g.asc);
+        g.gemm(g.aq, g.asc, t1, D, pl.out.off, pl.out_n, pl.out.s, pl.out_b, g.lo);
+        g.argmax(g.lo, t1, pl.out_n, g.ids);
+    }
+
+    /// GPU 路径：卷积前端 + 40 层 + 输出层全在 GPU 上跑，只回 t1 个 token id。
+    /// 同一 t1 的窗口用 CUDA graph replay（首次遇到该 t1 时正常跑一遍并捕获）。
     fn run_gpu(&self, x: &[[f32; DIM]]) -> Vec<u32> {
         let prof = std::env::var("WTL_GPU_PROF").is_ok();
         let t_all = std::time::Instant::now();
@@ -449,40 +505,47 @@ impl Model {
             g.upload_y3(&yq.q, &yq.s);
         }
         let t_front = t_all.elapsed();
-        g.gemm(g.y3q, g.ys, t1, FLAT, pl.lin.off, D, pl.lin.s, pl.lin_b, g.h);
         let tl = std::time::Instant::now();
-        for l in &pl.layers {
-            g.norm_quant(t1, D, l.pn_g, l.pn_b, g.xq, g.xs);
-            g.gemm(g.xq, g.xs, t1, D, l.q.off, D, l.q.s, NO_BIAS, g.q);
-            g.gemm(g.xq, g.xs, t1, D, l.k.off, D, l.k.s, NO_BIAS, g.k);
-            g.gemm(g.xq, g.xs, t1, D, l.v.off, D, l.v.s, NO_BIAS, g.v);
-            g.attention(t1, D, HEADS, g.q, g.k, g.v, g.att);
-            g.quant(g.att, t1, D, g.aq, g.asc);
-            g.gemm(g.aq, g.asc, t1, D, l.o.off, D, l.o.s, NO_BIAS, g.o);
-            // h += o，然后立刻对 h 做下一层的 norm+quant（融合成一个 kernel）
-            g.add_norm_quant(t1, D, l.mn_g, l.mn_b, g.xq, g.xs);
-            g.gemm(g.xq, g.xs, t1, D, l.f1.off, FF, l.f1.s, l.f1b, g.f);
-            g.gelu_quant(t1, FF, g.fq, g.fsc);
-            g.gemm(g.fq, g.fsc, t1, FF, l.f2.off, D, l.f2.s, l.f2b, g.o);
-            g.add(g.h, g.o, t1, D);
-        }
-        if prof {
-            g.sync();
+        let mut graph_used = false;
+        match g.graph_get(t1) {
+            Some(exec) => {
+                g.replay(exec);
+                graph_used = true;
+            }
+            None => {
+                // 首次遇到该 t1：廉价 warmup 所有形状 → 捕获 → 立刻 replay 得到本窗口结果。
+                // 捕获失败（或 graph 未启用）则退回逐 kernel 正常执行。
+                let mut done = false;
+                if self.graph_on() {
+                    self.warm_shapes(g, pl, t1);
+                    if g.capture_begin() {
+                        self.window_ops(g, pl, t1);
+                        if let Some(exec) = g.capture_end() {
+                            g.graph_put(t1, exec);
+                            g.replay(exec);
+                            done = true;
+                            graph_used = true;
+                            if prof {
+                                eprintln!("  [graph] t1={t1} 捕获 {} 个节点", g.graph_count());
+                            }
+                        }
+                    }
+                }
+                if !done {
+                    self.window_ops(g, pl, t1);
+                }
+            }
         }
         let t_layers = tl.elapsed();
-        let to = std::time::Instant::now();
-        g.quant(g.h, t1, D, g.aq, g.asc);
-        g.gemm(g.aq, g.asc, t1, D, pl.out.off, pl.out_n, pl.out.s, pl.out_b, g.lo);
-        g.argmax(g.lo, t1, pl.out_n, g.ids);
         g.sync();
         let ids = g.download_ids(t1);
         if prof {
             eprintln!(
-                "[gpu] t={t:4} t1={t1:4} gpu_front={:5} front={:6.2}ms layers={:6.2}ms out={:5.2}ms total={:6.2}ms",
+                "[gpu] t={t:4} t1={t1:4} gpu_front={:5} graph={:5} front={:6.2}ms window={:6.2}ms total={:6.2}ms",
                 gpu_front,
+                graph_used,
                 t_front.as_secs_f64() * 1e3,
                 t_layers.as_secs_f64() * 1e3,
-                to.elapsed().as_secs_f64() * 1e3,
                 t_all.elapsed().as_secs_f64() * 1e3
             );
         }

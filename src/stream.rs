@@ -16,6 +16,8 @@ const POST_DEFAULT: usize = 100;
 const PAD: usize = 50;
 /// 整段解码的上限（特征帧）：20 秒内定稿等待约 0.5 秒，70 秒要近 4 秒
 const WHOLE_MAX: usize = 2000;
+/// 超过这么多特征帧（=200 秒）才值得用 CUDA graph 舍入捕获开销；可用 WTL_GRAPH=0/1 强制
+const GRAPH_MIN_FRAMES: usize = 20000;
 
 pub struct Cfg {
     pub prev: usize,
@@ -44,6 +46,7 @@ pub struct Stream {
 
 impl Stream {
     pub fn new(m: Arc<Model>) -> Self {
+        m.set_graph_on(false);
         Stream { m, fb: Fbank::new(), feats: Vec::new(), ids: Vec::new(), s: 0, fresh: 0, cfg: Cfg::new() }
     }
 
@@ -55,6 +58,11 @@ impl Stream {
     pub fn push(&mut self, pcm: &[i16]) {
         let n = self.feats.len();
         self.fb.push(pcm, &mut self.feats);
+        // 批模式整段喂入时这里就知道总长度：超过阈值才启用 CUDA graph
+        // （短音频捕获/实例化开销 > 省下的 host 入队时间）
+        if self.feats.len() >= GRAPH_MIN_FRAMES {
+            self.m.set_graph_on(true);
+        }
         self.fresh += self.feats.len() - n;
         while self.feats.len() >= self.s + self.cfg.blk + self.cfg.post {
             self.commit();
