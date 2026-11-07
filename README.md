@@ -7,6 +7,7 @@
 - 批量吞吐：796s 音频 **2.80s 墙钟**（≈**284x 实时**，含首次预热与模型加载）
 - 正确性：int8 矩阵乘的 int32 累加与 CPU 参考实现**逐元素完全相同**；转录文本 CER 0~2.6%（差异全是同音字/单字级）
 - 无 GPU 也能跑：CPU 后端（int8 + AVX2/NEON + rayon）保留，同一份代码 `--cpu` 切换
+- **Mac（Apple Silicon）也能跑 GPU**：`mlx_backend/` 是 Python + MLX 的移植（M2 Pro 实测 **345x 实时**，1 小时音频 ≈10 s，CER ≈1.2%），见 [mlx_backend/README.md](mlx_backend/README.md)
 
 ## 实测（RTX 5060 Ti 16GB，12 核 Intel；同一进程批处理 6 条，`--blk 1600`）
 
@@ -98,10 +99,11 @@ cargo build --release
 ## 目录
 
 ```
-csrc/       CUDA 源码（编成单个 libwasr_gpu.so）
-src/        Rust：fbank / xnet / model / stream / kernels(CPU) / gpu(FFI) / bin/wasr
-scripts/    基准与验收脚本
-docs/       TECH-42 完整实测报告（线程扩展、逐阶段拆解、路线选型、nsys 数据）
+csrc/         CUDA 源码（编成单个 libwasr_gpu.so）
+csrc_mlx/     Apple Silicon 后端源码（编成 libwasr_mlx.a，链接 MLX 的 libmlx.dylib）
+src/          Rust：fbank / xnet / model / stream / kernels(CPU) / gpu(CUDA FFI) / mlx(MLX FFI) / bin/wasr
+scripts/      基准与验收脚本（scripts/mlx/ 是 Mac 侧的基准）
+docs/         TECH-42 完整实测报告 + MLX 移植报告（docs/MLX-REPORT.md）
 ```
 
 ## 三处已落地的重要优化
@@ -120,16 +122,56 @@ docs/       TECH-42 完整实测报告（线程扩展、逐阶段拆解、路线
 
 ## 性能现状与后续
 
-单窗口（t=150）耗时约 7ms：卷积前端 0.02ms + 40 层 7ms（attention 0.75、conv2+conv3 1.3、norm/quant 类 1.3、int8 GEMM 0.9、GEMM host 入队 1.28、epilogue+gelu 1.0，单位 ms）。
+单窗口（t=150）耗时约 7ms：卷积前端 0.02ms + 40 层 7ms（attention 0.75、conv2+conv3 1.3、norm/quant 类 1.3、int8 GEMM 0.9、GEMM host 入队 0.0015、epilogue+gelu 1.0，单位 ms）。
 
-按阿姆达尔排序的剩余优化（都还没做）：
+已落地：整窗 CUDA graph（long593 -6%）、fbank 并行化（58.65s 音频 29ms → 4ms）、cuBLASLt 算法选择磁盘缓存（单条 bv58 -16%）。
 
-1. 整窗口 CUDA graph（host 入队 1.28ms → ~1.5µs，-12%；库已有 capture API）
-2. conv2/conv3 的 shared-memory tiling（-9%）
-3. norm/quant 并行归约（-9%）
-4. TileLang/CUTLASS FMHA 版 attention（现状 18.8µs/次，目标 <10µs，-5%）
+试过但回退：conv2/conv3 的 shared-memory tiling（bv58 121→131ms、long593 555→654ms —— 卷积是 latency-bound 不是吞吐-bound，shared 用量把 occupancy 压到 ~2 block/SM）。
+
+剩余候选（按实测占比排序）：
+
+1. norm/quant 并行归约：4 个融合算子占窗口 13%，均值/方差现在在 thread0 串行累加（为了和 CPU 对拍），≈ -6%
+2. attention 换 fp16 / TileLang flash-attn：cuBLAS 版 18.8µs/次，TileLang 实测 7.15µs 但 C ABI 尚未验收
+3. fbank GPU 化：并行化后只剩 2~6%
 
 megakernel 不做：graph 已吃掉 host 开销，剩下都是真实计算。
+
+## Apple Silicon：MLX 后端（`--features mlx`）
+
+同一份 Rust 引擎，只把计算层换成 Apple 的 MLX——**不是另起一套**：fbank / `.xnet` 解析 / 权重打包 /
+分块解码 / CTC / CLI 全部复用，`--cpu` / `--gpu` / `--mlx` 在同一个二进制里切换。
+新增的只有 `csrc_mlx/wasr_mlx.cc`（对应 `csrc/*.cu`）+ `src/mlx.rs`（对应 `src/gpu.rs`）+ plan 结构体。
+
+```bash
+python3 -m pip install --user mlx          # 提供 MLX 的 C++ 头文件与 libmlx.dylib，build.rs 会自动定位
+cargo build --release --no-default-features --features mlx
+./target/release/wasr ./models/wtmodel --mlx --batch 4 a.wav b.wav    # 输出格式与 CUDA 版一致
+```
+
+| 后端 | bv58.wav（58.65s） | 倍实时 | 1 小时音频 | 备注 |
+|---|---:|---:|---:|---|
+| **MLX fp16**（M2 Pro 16 核 GPU / 32GB） | **141 ms** | **416x** | ≈9 s | `--mlx --batch 4`，稳定态 |
+| Rust CPU（M2 Pro，标量回退） | 3306 ms | 17.7x | ≈3.4 min | 同一份代码 `--cpu` |
+| CUDA int8（RTX 5060 Ti） | 53 ms | 1107x | ≈3 s | 本仓库 CUDA 版 |
+
+**为什么不是把 CUDA 版翻译一遍**：CUDA 版 91% 的算力是一个 int8 GEMM（W8A8 + int32 累加 + 融合
+反量化 epilogue），而 **Apple GPU（M1–M4）没有 int8 矩阵单元**：`mx.matmul` 只收浮点、`quantized_matmul`
+是 weight-only 且实测比直接 fp16 GEMM 还慢、MPS 的整数矩阵乘只出 fp16/fp32。
+所以 MLX 后端在 create 时把 int8 权重一次性反量化成 fp16，前向全 fp16（MLX 的 matmul 内部是 fp32 累加，
+实测相对误差 4.6e-4，比原版 int8 激活量化本身的 4e-3 还小一个数量级）。
+
+三处关键优化（都在 Rust 侧/后端内）：
+
+- **批窗口**：这是 CTC 编码器，窗口之间没有状态依赖，`--batch N` 把 N 个固定网格窗口堆成一个 batch，
+  GEMM 从 (390,512) 变成 (N·390,512)，fp16 利用率 11% → 45%；
+- **`mx.compile` 整窗图**：40 层约 480 次 dispatch 融合成一张图，-29%（对应 CUDA 版的整窗 graph）；
+- **q/k/v 一次算完 + attention 走 `fast::scaled_dot_product_attention`**。
+
+精度：与 CUDA/int8 版转录对比 **CER ≈1.2%**（bv58，差异全是同音字），`real1` 逐字一致——与现有
+CPU↔GPU 的差异同量级。**不是逐位一致**：要逐位复刻 int8 契约只能在 Metal 上手写 int8×int8→int32 GEMM
+（整数加法与顺序无关）；M5 起的 Metal 4 TensorOps 有原生 int8 `matmul2d`，那是另一条线。
+
+细节、数值实验、优化历程、M5 预期：[docs/MLX-REPORT.md](docs/MLX-REPORT.md)。
 
 ## License
 

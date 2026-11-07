@@ -6,7 +6,10 @@
 //!     详见 src/gpu.rs。GPU 路径的 int8 结果与 CPU 逐元素相同，仅归一化/注意力刻意复刻
 //!     CPU 的浮点求和顺序以保持可对拍。
 use crate::fbank::DIM;
+#[cfg(feature = "cuda")]
 use crate::gpu::{Gpu, NO_BIAS};
+#[cfg(feature = "mlx")]
+use crate::mlx::{Mlx, WlLayerPlan, WlPlan};
 use crate::kernels::{dotf, qgemm, quant, QAct};
 use crate::xnet::{self, Rec, F32, I8};
 use anyhow::{bail, Context, Result};
@@ -28,6 +31,7 @@ const K3: usize = F2 * 9;
 const W2: usize = DIM + 1; // 第二层卷积后频率维补一列 0
 const FLAT: usize = F3 * 20;
 /// GPU 路径一次能吃的最大输出帧数（t1）；超过则退回 CPU（正常流式窗口 t1 ≤ 400）
+#[cfg(feature = "cuda")]
 const TMAX: usize = 512;
 
 struct Q {
@@ -51,12 +55,14 @@ struct Layer {
 }
 
 /// GPU 权重 blob 里一个 int8 权重矩阵的位置（256B 对齐的偏移）
+#[cfg(any(feature = "cuda", feature = "mlx"))]
 #[derive(Clone, Copy)]
 struct PlanQ {
     off: usize,
     s: f32,
 }
 
+#[cfg(any(feature = "cuda", feature = "mlx"))]
 struct PlanLayer {
     pn_g: usize,
     pn_b: usize,
@@ -72,6 +78,7 @@ struct PlanLayer {
     f2b: usize,
 }
 
+#[cfg(any(feature = "cuda", feature = "mlx"))]
 struct Plan {
     layers: Vec<PlanLayer>,
     lin: PlanQ,
@@ -97,9 +104,15 @@ pub struct Model {
     out: Q,
     out_b: Vec<f32>,
     vocab: Vec<String>,
+    #[cfg(feature = "cuda")]
     gpu: Option<Gpu>,
+    #[cfg(feature = "cuda")]
     plan: Option<Plan>,
+    /// Apple Silicon / MLX 后端（`--mlx`）
+    #[cfg(feature = "mlx")]
+    mlx: Option<Mlx>,
     /// 是否允许用 CUDA graph（由批模式的音频长度决定：短音频捕获开销不划算）
+    #[cfg(feature = "cuda")]
     graph_on: std::sync::atomic::AtomicBool,
 }
 
@@ -133,10 +146,12 @@ impl Loader<'_> {
 }
 
 /// 把 GPU 需要的权重/参数按 256B 对齐拼成一个连续 blob（libwtlgpu 要求对齐指针）
+#[cfg(any(feature = "cuda", feature = "mlx"))]
 struct Blob {
     buf: Vec<u8>,
 }
 
+#[cfg(any(feature = "cuda", feature = "mlx"))]
 impl Blob {
     fn new() -> Blob {
         Blob { buf: Vec::with_capacity(160 << 20) }
@@ -183,6 +198,7 @@ impl Blob {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "mlx"))]
 fn build_plan(l: &Loader, vocab: usize) -> Result<(Plan, Vec<u8>)> {
     let mut b = Blob::new();
     let mut layers = Vec::with_capacity(LAYERS);
@@ -257,12 +273,23 @@ impl Model {
             bail!("词表大小 {} 与模型输出 {out} 不符", vocab.len());
         }
         // GPU 后端：一次性把权重拼成对齐 blob 并上传（135MB，约 30~60ms）
+        #[cfg(feature = "cuda")]
         let (gpu, plan) = if std::env::var("WTL_GPU").is_ok() {
             let (plan, blob) = build_plan(&l, out)?;
             let g = Gpu::new(&blob, TMAX, D, FF, plan.out_n, FLAT, HEADS);
             (Some(g), Some(plan))
         } else {
             (None, None)
+        };
+        // MLX 后端（Apple Silicon）：复用同一份 blob/plan，交给 csrc_mlx 一次性反量化成 fp16
+        #[cfg(feature = "mlx")]
+        let mlx = if std::env::var("WTL_MLX").is_ok() {
+            let (pl, blob) = build_plan(&l, out)?;
+            let (wl_layers, wl_plan) = to_wl_plan(&pl);
+            let _ = &wl_layers; // 必须活到 create 结束：wl_plan.layers 指向它
+            Some(Mlx::new(&blob, &wl_plan))
+        } else {
+            None
         };
         Ok(Model {
             c1: l.f32("frontend.conv2d.weight", &[F1, 1, 5, 5])?,
@@ -275,17 +302,28 @@ impl Model {
             out_b: l.f32("output_conv.bias", &[out])?,
             vocab,
             map,
+            #[cfg(feature = "cuda")]
             gpu,
+            #[cfg(feature = "cuda")]
             plan,
+            #[cfg(feature = "mlx")]
+            mlx,
+            #[cfg(feature = "cuda")]
             graph_on: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// 由 Stream 按音频长度设置的开关：长音频才值得图化（短音频捕获开销 > 省下的 host 时间）
+    #[cfg(feature = "cuda")]
     pub fn set_graph_on(&self, on: bool) {
         self.graph_on.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// MLX / CPU 后端没有 CUDA graph 这回事，保持空实现以免调用点到处 cfg
+    #[cfg(not(feature = "cuda"))]
+    pub fn set_graph_on(&self, _on: bool) {}
+
+    #[cfg(feature = "cuda")]
     fn graph_on(&self) -> bool {
         if std::env::var("WTL_NO_GRAPH").is_ok() {
             return false;
@@ -297,7 +335,27 @@ impl Model {
     }
 
     pub fn gpu_enabled(&self) -> bool {
-        self.gpu.is_some()
+        #[cfg(feature = "cuda")]
+        if self.gpu.is_some() {
+            return true;
+        }
+        #[cfg(feature = "mlx")]
+        if self.mlx.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// 是否在用 Apple Silicon / MLX 后端
+    #[cfg(feature = "mlx")]
+    pub fn mlx_enabled(&self) -> bool {
+        self.mlx.is_some()
+    }
+
+    /// 批窗口前向：B 个等长窗口一次算完（MLX 后端）
+    #[cfg(feature = "mlx")]
+    pub fn forward_batch(&self, windows: &[Vec<[f32; DIM]>], t: usize) -> Vec<Vec<u32>> {
+        self.mlx.as_ref().expect("forward_batch 需要 MLX 后端").forward_batch(windows, t)
     }
 
     fn mm(&self, x: &QAct, q: &Q, b: Option<&[f32]>) -> Vec<f32> {
@@ -308,6 +366,11 @@ impl Model {
 
     /// 输入归一化特征帧，输出每个 50ms 输出帧的 argmax token id
     pub fn forward(&self, x: &[[f32; DIM]]) -> Vec<u32> {
+        #[cfg(feature = "mlx")]
+        if let Some(m) = &self.mlx {
+            return m.forward(x);
+        }
+        #[cfg(feature = "cuda")]
         if self.gpu.is_some() {
             // GPU 路径：前端仍用全核 rayon（不在 4 线程小池里），GPU 部分异步发起
             return self.run_gpu(x);
@@ -440,6 +503,7 @@ impl Model {
 
     /// 只把该 t1 下所有 (k, n, t) 形状喂给 cuBLASLt 一次（触发算法缓存/句柄创建），
     /// 让随后 capture 不会撞到 -6（未 warmup）；代价 ~几十 µs，不用跑整窗。
+    #[cfg(feature = "cuda")]
     fn warm_shapes(&self, g: &Gpu, pl: &Plan, t1: usize) {
         let xs = g.xs;
         let xq = g.xq;
@@ -454,6 +518,7 @@ impl Model {
     }
 
     /// 整窗算子序列（不含上传/同步/取回）：正常执行与 CUDA graph 捕获共用同一份代码
+    #[cfg(feature = "cuda")]
     fn window_ops(&self, g: &Gpu, pl: &Plan, t1: usize) {
         g.gemm(g.y3q, g.ys, t1, FLAT, pl.lin.off, D, pl.lin.s, pl.lin_b, g.h);
         for l in &pl.layers {
@@ -477,6 +542,7 @@ impl Model {
 
     /// GPU 路径：卷积前端 + 40 层 + 输出层全在 GPU 上跑，只回 t1 个 token id。
     /// 同一 t1 的窗口用 CUDA graph replay（首次遇到该 t1 时正常跑一遍并捕获）。
+    #[cfg(feature = "cuda")]
     fn run_gpu(&self, x: &[[f32; DIM]]) -> Vec<u32> {
         let prof = std::env::var("WTL_GPU_PROF").is_ok();
         let t_all = std::time::Instant::now();
@@ -574,6 +640,54 @@ impl Model {
         }
         s
     }
+}
+
+/// blob 里的偏移表 → MLX 后端的 plan（字段顺序与 csrc_mlx/wasr_mlx.cc 的 wl_plan 一致）
+#[cfg(feature = "mlx")]
+fn to_wl_plan(pl: &Plan) -> (Vec<WlLayerPlan>, WlPlan) {
+    let layers: Vec<WlLayerPlan> = pl
+        .layers
+        .iter()
+        .map(|l| WlLayerPlan {
+            pn_g: l.pn_g,
+            pn_b: l.pn_b,
+            mn_g: l.mn_g,
+            mn_b: l.mn_b,
+            q: l.q.off,
+            qs: l.q.s,
+            k: l.k.off,
+            ks: l.k.s,
+            v: l.v.off,
+            vs: l.v.s,
+            o: l.o.off,
+            os: l.o.s,
+            f1: l.f1.off,
+            f1s: l.f1.s,
+            f1b: l.f1b,
+            f2: l.f2.off,
+            f2s: l.f2.s,
+            f2b: l.f2b,
+        })
+        .collect();
+    let plan = WlPlan {
+        layers: layers.as_ptr(),
+        n_layers: layers.len() as i32,
+        lin: pl.lin.off,
+        lin_s: pl.lin.s,
+        lin_b: pl.lin_b,
+        out: pl.out.off,
+        out_s: pl.out.s,
+        out_b: pl.out_b,
+        vocab: pl.out_n as i32,
+        d: D as i32,
+        ff: FF as i32,
+        flat: FLAT as i32,
+        heads: HEADS as i32,
+        c1: pl.c1,
+        c2: pl.c2,
+        c3: pl.c3,
+    };
+    (layers, plan)
 }
 
 fn norm(x: &[f32], (g, b): &(Vec<f32>, Vec<f32>)) -> Vec<f32> {

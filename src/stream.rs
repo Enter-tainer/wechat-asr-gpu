@@ -69,6 +69,56 @@ impl Stream {
         }
     }
 
+    /// 只跑 fbank、不做分块解码。批窗口模式（`--mlx --batch N`）用：
+    /// 整个文件先出完特征，再按固定网格一次性批算。
+    pub fn push_raw(&mut self, pcm: &[i16]) {
+        self.fb.push(pcm, &mut self.feats);
+        self.fresh = self.feats.len();
+    }
+
+    /// 批窗口整段解码（MLX 后端）：固定网格 + B 个窗口一批 + 每窗只取自己的 [s, s+blk) 区间。
+    ///
+    /// 为什么可以批：这是 CTC 编码器，窗口之间没有模型状态依赖（上下文只来自音频 prev/post 重叠），
+    /// 所以 B 个窗口堆成一个 batch 后 GEMM 从 (390,512) 变成 (B*390,512)，
+    /// M2 Pro 上 fp16 利用率从 ~11% 提到 ~45%（bv58 254ms → 170ms）。
+    #[cfg(feature = "mlx")]
+    pub fn finish_mlx_batched(self, batch: usize) -> String {
+        let n = self.feats.len();
+        if n == 0 {
+            return String::new();
+        }
+        if n <= WHOLE_MAX {
+            // 与 Rust 原有的整段解码一致：不补 pad、不加左侧上下文
+            return tidy(&self.m.text(&self.m.forward(&self.feats)));
+        }
+        let (prev, blk, post) = (self.cfg.prev, self.cfg.blk, self.cfg.post);
+        let sil = self.fb.silence();
+        let head = prev / 5;
+        let batch = batch.max(1);
+        let starts: Vec<usize> = (0..n).step_by(blk).collect();
+        let full: Vec<usize> = starts.iter().copied().filter(|&s| s + blk <= n).collect();
+        let tail: Vec<usize> = starts.iter().copied().filter(|&s| s + blk > n).collect();
+        let mut groups: Vec<Vec<usize>> = full.chunks(batch).map(|c| c.to_vec()).collect();
+        if !tail.is_empty() {
+            groups.push(tail);
+        }
+        let mut ids: Vec<u32> = Vec::new();
+        for grp in groups {
+            let tail_grp = grp[0] + blk > n;
+            let wins: Vec<Vec<[f32; DIM]>> =
+                grp.iter().map(|&s0| window(&self.feats, &sil, s0, prev, blk, post, n, !tail_grp)).collect();
+            let t = wins[0].len();
+            for (&s0, out) in grp.iter().zip(self.m.forward_batch(&wins, t).iter()) {
+                let avail = blk.min(n - s0);
+                // 最后一个窗口多收 50 帧 pad 的 id，否则末尾半个字会被截掉
+                let keep = avail / 5 + if tail_grp { PAD / 5 } else { 0 };
+                let hi = (head + keep).min(out.len());
+                ids.extend_from_slice(&out[head.min(hi)..hi]);
+            }
+        }
+        tidy(&self.m.text(&ids))
+    }
+
     /// 距上次中间结果新增的特征帧数
     pub fn fresh(&self) -> usize {
         self.fresh
@@ -119,6 +169,39 @@ impl Stream {
 }
 
 const PUNCT: &[char] = &['，', '。', '？', '！', '、', ',', '.', '?', '!'];
+
+/// 拼一个固定网格窗口：[s0-prev, s0+blk+post) + 末尾 PAD 帧静音；左右不足补静音。
+/// full=true 时补齐到 prev+blk+post（同批窗口必须等长），false 给最后一个窗口按真实长度收尾。
+#[cfg(feature = "mlx")]
+fn window(
+    feats: &[[f32; DIM]],
+    sil: &[f32; DIM],
+    s0: usize,
+    prev: usize,
+    blk: usize,
+    post: usize,
+    n: usize,
+    full: bool,
+) -> Vec<[f32; DIM]> {
+    let left = prev.min(s0);
+    let a = s0 - left;
+    let b = (s0 + blk + post).min(n);
+    let t_win = prev + blk + post;
+    let mut x: Vec<[f32; DIM]> = Vec::with_capacity(t_win + PAD);
+    for _ in 0..(prev - left) {
+        x.push(*sil);
+    }
+    x.extend_from_slice(&feats[a..b]);
+    if full {
+        while x.len() < t_win {
+            x.push(*sil);
+        }
+    }
+    for _ in 0..PAD {
+        x.push(*sil);
+    }
+    x
+}
 
 /// 开口前的底噪偶尔被识别成一个逗号；偶尔出现「，。」这样的连续标点，只留后一个
 fn tidy(t: &str) -> String {

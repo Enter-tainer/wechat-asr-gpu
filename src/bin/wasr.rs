@@ -16,13 +16,38 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use wechat_asr_gpu::{load, pack, Stream};
+use wechat_asr_gpu::{load, pack};
+
+/// 后端名字（打印用）
+fn backend_name(m: &wechat_asr_gpu::Model) -> &'static str {
+    if !m.gpu_enabled() {
+        return "CPU";
+    }
+    #[cfg(feature = "mlx")]
+    if m.mlx_enabled() {
+        return "MLX";
+    }
+    "GPU"
+}
+
+/// JSON 里的后端名
+fn backend_tag(m: &wechat_asr_gpu::Model) -> &'static str {
+    if !m.gpu_enabled() {
+        return "cpu";
+    }
+    #[cfg(feature = "mlx")]
+    if m.mlx_enabled() {
+        return "mlx";
+    }
+    "gpu"
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!(
-            "用法: wasr <模型目录> [--gpu] [--cpu] [--threads N] [--blk N] [--json FILE] [--txt DIR] <a.wav> [b.wav ...]\n\
+            "用法: wasr <模型目录> [--gpu|--mlx|--cpu] [--batch N] [--threads N] [--blk N] [--json FILE] [--txt DIR] <a.wav> [b.wav ...]\n\
+             --mlx 需要 macOS + 用 --features mlx 编译（见 README）；--batch 是 MLX 批窗口数（默认 4）\n\
              解包官方语音包: wasr --unpack <pak.apk> <模型输出目录>"
         );
         std::process::exit(2);
@@ -38,11 +63,27 @@ fn main() {
     let mut files: Vec<String> = Vec::new();
     let (mut json_out, mut txt_dir) = (None::<String>, None::<String>);
     let mut gpu = false;
+    let mut mlx = false;
+    let mut batch = 4usize;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--gpu" => gpu = true,
-            "--cpu" => gpu = false,
+            "--gpu" => {
+                gpu = true;
+                mlx = false;
+            }
+            "--mlx" => {
+                mlx = true;
+                gpu = false;
+            }
+            "--cpu" => {
+                gpu = false;
+                mlx = false;
+            }
+            "--batch" => {
+                i += 1;
+                batch = args[i].parse().unwrap_or(4);
+            }
             "--threads" => {
                 i += 1;
                 std::env::set_var("WTL_THREADS", &args[i]);
@@ -66,6 +107,15 @@ fn main() {
     if gpu {
         std::env::set_var("WTL_GPU", "1");
     }
+    if mlx {
+        #[cfg(feature = "mlx")]
+        std::env::set_var("WTL_MLX", "1");
+        #[cfg(not(feature = "mlx"))]
+        {
+            eprintln!("这个二进制没有编 MLX 后端：cargo build --release --no-default-features --features mlx");
+            std::process::exit(2);
+        }
+    }
     if std::env::var("WTL_BLK").is_err() {
         std::env::set_var("WTL_BLK", "1600"); // 批模式默认块长
     }
@@ -80,10 +130,11 @@ fn main() {
     };
     let load_ms = t0.elapsed().as_secs_f64() * 1e3;
     eprintln!(
-        "load {load_ms:.0}ms  backend={}  threads={}  blk={}",
-        if m.gpu_enabled() { "GPU" } else { "CPU" },
+        "load {load_ms:.0}ms  backend={}  threads={}  blk={}  batch={}",
+        backend_name(&m),
         std::env::var("WTL_THREADS").unwrap_or_else(|_| "8".into()),
-        std::env::var("WTL_BLK").unwrap_or_else(|_| "1600".into())
+        std::env::var("WTL_BLK").unwrap_or_else(|_| "1600".into()),
+        batch
     );
     if files.is_empty() {
         eprintln!("没有输入音频");
@@ -91,7 +142,7 @@ fn main() {
     }
 
     let mut rows = Vec::new();
-    let batch = Instant::now();
+    let batch_t0 = Instant::now();
     let (mut total_audio, mut total_ms) = (0.0f64, 0.0f64);
     for f in &files {
         let name = Path::new(f).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -104,10 +155,8 @@ fn main() {
         };
         let audio = pcm.len() as f64 / 16000.0;
         let t = Instant::now();
-        let mut s = Stream::new(m.clone());
-        // 批模式整段喂入：fbank 可以按帧并行；commit 仍按 --blk 分块进行
-        s.push(&pcm);
-        let text = s.finish();
+        // 批模式整段喂入：MLX 后端且 --batch>1 时走批窗口，否则走原来的串行分块
+        let text = wechat_asr_gpu::transcribe(m.clone(), &pcm, batch);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         total_audio += audio;
         total_ms += ms;
@@ -118,7 +167,7 @@ fn main() {
         }
         rows.push((name, audio, ms, ms / 1000.0 / audio, text));
     }
-    let wall = batch.elapsed().as_secs_f64();
+    let wall = batch_t0.elapsed().as_secs_f64();
     eprintln!(
         "\n批模式: {} 条, 音频 {:.1}s, 解码合计 {:.2}s, 批墙钟 {:.2}s, 聚合 {:.1}x 实时, 平均 RTF {:.4}",
         rows.len(),
@@ -135,10 +184,11 @@ fn main() {
         writeln!(f, "{{").unwrap();
         writeln!(
             f,
-            "  \"backend\": \"{}\", \"threads\": {}, \"blk\": {}, \"load_ms\": {:.0},",
-            if m.gpu_enabled() { "gpu" } else { "cpu" },
+            "  \"backend\": \"{}\", \"threads\": {}, \"blk\": {}, \"batch\": {}, \"load_ms\": {:.0},",
+            backend_tag(&m),
             std::env::var("WTL_THREADS").unwrap_or_else(|_| "8".into()),
             std::env::var("WTL_BLK").unwrap_or_else(|_| "1600".into()),
+            batch,
             load_ms
         )
         .unwrap();
