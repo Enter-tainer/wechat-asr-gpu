@@ -71,7 +71,7 @@
 | (6400,512)@(512,2048)（B=4 批） | 2.88 ms | 4.66 |
 | 40 层整窗（T=1600 输出帧） | 153 ms | 4.0（含 attention） |
 
-### 3.4 数值漂移（`bench_num.py`）
+### 3.4 数值漂移
 
 同一次 int8 量化，三条路径对比（FF up，t=1600,k=512,n=2048）：
 
@@ -149,7 +149,7 @@ cargo build --release --no-default-features --features mlx
 **但现成代码直接上 M5，只能吃到 fp16 那一档**：
 
 1. **MLX 用不上 TensorOps**。MLX 的 GEMM（`nax.h`）对量化权重是"反量化成 fp16/bf16 再算"，
-   从来不走 int8×int8→int32；官方那个 int8 路径的 PR 默认关闭。所以同一份 `mlx_backend/` 在 M5 上
+   从来不走 int8×int8→int32；官方那个 int8 路径的 PR 默认关闭。所以现在这版 `csrc_mlx/` 后端在 M5 上
    仍按 fp16 ALU 跑。
 2. `mx.fast.metal_kernel`（内联 MSL）也帮不上：它自动生成的 wrapper 会插入非一致控制流，
    与 `cooperative_tensor` 要求的"整个 simdgroup 均匀参与"冲突。要写 TensorOps kernel 得走
@@ -174,14 +174,10 @@ TensorOps 的 16×32×16 tile 利用率不如 LLM prefill 那种 K=4096 的大�
 
 1. **M5+ 的 Metal 4 TensorOps**（`matmul2d` 原生 int8×int8→int32）：这代硬件才有 int8 矩阵单元，
    届时可以 1:1 平移 CUDA 版的 W8A8 契约，速度也有机会翻倍。M1–M4 无解。
-2. **让 Rust 版在 macOS 上编得过**（现在编不过，两个点）：
-   `src/gpu.rs` 的 `#[link(name="wasr_gpu")]` 是无条件的、`build.rs` 找不到 nvcc 直接 panic
-   （`WTL_SKIP_CUDA=1` 只是跳过编译、不生成 link 指令，链接仍失败）→ 加 feature gate 或 23 个空符号的 stub；
-   `vdotq_s32` 需要 nightly（`#![feature(stdarch_neon_dotprod)]`）或用 `asm!` 重写。
-   这一步只为了在 Mac 上拿到"逐位一致"的 CPU 参考实现，半天工作量。
-3. **流式中间结果**（`partial()`）：`decode.py` 里已有，CLI 没接；批模式不需要，流式场景要补。
-4. **fp16 之外的精度选项**：`--fp32` 已支持（更准、约慢 1.6x），可作为验收对照。
-5. **不要做**：CoreML/ANE 整体迁移（动态 per-row 量化 + 自定义 epilogue + 流式循环都不匹配，
+2. ~~让 Rust 版在 macOS 上编得过~~ **已做**：CUDA 侧全部 feature gate、`build.rs` 按 feature 走，
+   `cargo build --release --no-default-features --features mlx` 在 Apple Silicon 上直接能编出来。
+3. **流式中间结果**：`Stream::partial()` 已有，CLI 没接；批模式不需要，流式场景要补。
+4. **不要做**：CoreML/ANE 整体迁移（动态 per-row 量化 + 自定义 epilogue + 流式循环都不匹配，
    且公开先例里 ANE 普遍比 GPU 慢）；手写 Metal int8（除非要逐字一致，且性能不会比 MLX 高，
    因为 Apple GPU 的 int8 与 fp16 走同一套 ALU，只省一半权重带宽）。
 
@@ -194,11 +190,8 @@ cargo build --release --no-default-features --features mlx
 ./target/release/wasr ./models/wtmodel --mlx --batch 4 test/bv58.wav
 WASR_MLX_DEBUG=1 ./target/release/wasr ... # 打点（定位崩溃/慢在哪一步）
 
-# 基准脚本在 scripts/mlx/：
-#   bench_cpu_neon.rs   CPU int8 微基准（需要 nightly，stable 上 vdotq_s32 还是 unstable）
-#   bench_mlx.py        复刻算子形状的 fp16 吞吐
-#   bench_mlx_opt.py    批窗口 / layernorm 变体
-#   bench_num.py        fp16 vs int32 累加的数值漂移
+# 基准脚本：scripts/mlx/bench_cpu_neon.rs（CPU int8 微基准，需要 nightly，
+# stable 上 vdotq_s32 还是 unstable）
 ```
 
 > 注：`scripts/mlx/bench_cpu_neon.rs` 需要用 nightly 编（`rustc +nightly -O`），

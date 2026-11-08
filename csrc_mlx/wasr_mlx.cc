@@ -8,7 +8,7 @@
 //   这里: 权重在 create 时一次性反量化成 fp16；前向全 fp16（matmul 内部 fp32 累加），
 //         attention 走 MLX 的 flash-attention 原语，LN/GELU 在 fp32 里算再回 fp16。
 //   原因：Apple GPU（M1–M4）没有 int8 矩阵单元，MLX 的 matmul 也不收整数。
-//   实测（scripts/mlx/bench_num.py）：fp16 路线的相对误差 4.6e-4，比 int8 激活量化本身的
+//   实测：fp16 路线的相对误差 4.6e-4，比 int8 激活量化本身的
 //   4e-3 还小一个数量级；与 CUDA 版转录对比 CER 1.2%。
 //
 // ABI：见下方 extern "C"。Rust 侧 src/mlx.rs 一一对应。
